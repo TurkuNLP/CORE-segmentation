@@ -1,0 +1,2 @@
+cat results/modernbert/en_cleanlab_filtered/_*/test_predictions.jsonl > test_predictions_filtered.jsonl
+cat results/modernbert/en_cleanlab_filtered/_*/test_embeddings.jsonl > test_embeddings_filtered.jsonl

@@ -1,0 +1,415 @@
+import json
+import sys
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from datasets import Dataset
+from sklearn.metrics import classification_report, f1_score
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    EarlyStoppingCallback,
+    Trainer,
+    TrainingArguments,
+    AutoConfig,
+)
+
+from torch.utils.data import DataLoader
+from labels import labels, convert_to_label_ids
+
+models = {
+    "modernbert": "answerdotai/ModernBERT-large",
+}
+
+model_type = sys.argv[1] if len(sys.argv) > 1 else ""
+dataset = sys.argv[2] if len(sys.argv) > 2 else ""
+TRAIN = len(sys.argv) > 3 and sys.argv[3] == "train"
+EMBED_ALL = len(sys.argv) > 4 and sys.argv[4] == "embed_all"
+
+if model_type not in models:
+    print(f"Invalid model type: {model_type}")
+    sys.exit(1)
+if not dataset:
+    print(f"Invalid dataset: {dataset}")
+    sys.exit(1)
+
+working_dir = f"./results/{model_type}/{dataset}"
+
+# Enable TF32
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+# Custom Focal Loss for multi-label classification
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.5, gamma=1.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+
+    def forward(self, pred, target):
+        sigmoid_pred = torch.sigmoid(pred)
+        bce_loss = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+        pt = torch.where(target == 1, sigmoid_pred, 1 - sigmoid_pred)
+        focal_weight = torch.pow(1 - pt, self.gamma)
+
+        if self.alpha != 1:
+            alpha_weight = torch.where(target == 1, self.alpha, 1)
+            focal_weight = focal_weight * alpha_weight
+
+        focal_loss = focal_weight * bce_loss
+        return focal_loss.mean()
+
+
+# Custom Trainer with Focal Loss
+class FocalLossTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.focal_loss = FocalLoss(alpha=0.5, gamma=1.0)
+
+    def compute_loss(
+        self, model, inputs, return_outputs=False, num_items_in_batch=None
+    ):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        loss = self.focal_loss(logits, labels)
+        return (loss, outputs) if return_outputs else loss
+
+
+def load_tsv(file_path):
+    df = pd.read_csv(
+        file_path,
+        sep="\t",
+        header=None,
+        names=["labels", "text"],
+        na_values=None,
+        keep_default_na=False,
+    )
+    return [
+        {
+            "text": row["text"],
+            "labels": row["labels"].split() if pd.notna(row["labels"]) else [],
+        }
+        for _, row in df.iterrows()
+    ]
+
+
+# Load datasets from TSV
+train_data = load_tsv(f"{dataset}/train.tsv")
+dev_data = load_tsv(f"{dataset}/dev.tsv")
+test_data = load_tsv(f"{dataset}/test.tsv")
+
+# Convert to HuggingFace datasets
+train_dataset = Dataset.from_list(train_data)
+dev_dataset = Dataset.from_list(dev_data)
+test_dataset = Dataset.from_list(test_data)
+
+# Convert labels to multi-hot encoding
+train_dataset = train_dataset.map(convert_to_label_ids)
+dev_dataset = dev_dataset.map(convert_to_label_ids)
+test_dataset = test_dataset.map(convert_to_label_ids)
+
+# Load model
+num_labels = len(labels)
+model_name = models[model_type]
+
+config = AutoConfig.from_pretrained(
+    model_name,
+    output_hidden_states=False,
+    problem_type="multi_label_classification",
+    num_labels=num_labels,
+)
+model = AutoModelForSequenceClassification.from_pretrained(
+    model_name,
+    config=config,
+)
+
+model = model.to("cuda")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+
+def tokenize_function(examples):
+    return tokenizer(
+        examples["text"], padding="max_length", truncation=True, max_length=8192
+    )
+
+
+# Tokenize and format datasets
+tokenized_train = train_dataset.map(tokenize_function, batched=True)
+tokenized_dev = dev_dataset.map(tokenize_function, batched=True)
+tokenized_test = test_dataset.map(tokenize_function, batched=True)
+
+tokenized_train.set_format(
+    type="torch", columns=["input_ids", "attention_mask", "labels"]
+)
+tokenized_dev.set_format(
+    type="torch", columns=["input_ids", "attention_mask", "labels"]
+)
+tokenized_test.set_format(
+    type="torch", columns=["input_ids", "attention_mask", "labels"]
+)
+
+
+def optimize_threshold(predictions, labels_ids):
+    best_f1 = 0
+    best_threshold = 0.5
+    thresholds = np.arange(0.3, 0.75, 0.05)
+
+    for threshold in thresholds:
+        predictions_binary = (
+            (torch.sigmoid(torch.tensor(predictions)) > threshold).numpy().astype(int)
+        )
+        f1 = f1_score(labels_ids, predictions_binary, average="micro")
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+
+    return best_threshold
+
+
+def compute_metrics(eval_pred):
+    predictions, labels_ids = eval_pred
+    best_threshold = optimize_threshold(predictions, labels_ids)
+    predictions = (
+        (torch.sigmoid(torch.tensor(predictions)) > best_threshold).numpy().astype(int)
+    )
+
+    micro_f1 = f1_score(labels_ids, predictions, average="micro")
+    macro_f1 = f1_score(labels_ids, predictions, average="macro")
+    weighted_f1 = f1_score(labels_ids, predictions, average="weighted")
+
+    report = classification_report(
+        labels_ids, predictions, target_names=labels, zero_division=0, output_dict=True
+    )
+
+    print(f"\nOptimal threshold: {best_threshold:.3f}")
+    print("\nClassification Report:")
+    print(
+        classification_report(
+            labels_ids, predictions, target_names=labels, zero_division=0
+        )
+    )
+
+    return {
+        "micro_f1": micro_f1,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
+        "optimal_threshold": best_threshold,
+        "classification_report": report,
+    }
+
+
+# Training arguments
+training_args = TrainingArguments(
+    output_dir=working_dir,
+    eval_strategy="steps",
+    eval_steps=500,
+    # per_device_train_batch_size=8,
+    per_device_train_batch_size=1,
+    gradient_accumulation_steps=8,
+    per_device_eval_batch_size=32,
+    num_train_epochs=5,
+    load_best_model_at_end=True,
+    metric_for_best_model="micro_f1",
+    greater_is_better=True,
+    save_strategy="steps",
+    save_steps=500,
+    save_total_limit=2,
+    max_grad_norm=1.0,
+    learning_rate=3e-5,
+    warmup_ratio=0.05,
+    weight_decay=0.01,
+    tf32=True,
+    group_by_length=True,
+    bf16=True if model_type != "modernbert" else False,
+    fp16=True if model_type == "modernbert" else False,
+)
+
+# Initialize trainer with Focal Loss
+trainer = FocalLossTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_train,
+    eval_dataset=tokenized_dev,
+    compute_metrics=compute_metrics,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=10)],
+)
+
+# Train
+if TRAIN:
+    trainer.train()
+
+    # Save model and tokenizer
+    trainer.save_model(f"{working_dir}/best_model")
+    tokenizer.save_pretrained(f"{working_dir}/best_model")
+    print(f"\nBest model saved to {working_dir}/best_model")
+
+# For final test evaluation, create a new model instance with hidden states enabled
+print("\nLoading best model for test evaluation...")
+config = AutoConfig.from_pretrained(f"{working_dir}/best_model")
+config.output_hidden_states = False
+model = AutoModelForSequenceClassification.from_pretrained(
+    f"{working_dir}/best_model", config=config
+)
+
+# Replace this section in your evaluation code
+model = model.to("cuda")
+model.eval()
+
+trainer.model = model
+
+# Evaluate on test set
+print("\nFinal Test Set Evaluation:")
+test_results = trainer.evaluate(tokenized_test)
+
+# Get optimal threshold from test results
+optimal_threshold = test_results["eval_optimal_threshold"]
+
+print(f"\nOptimal test threshold: {optimal_threshold:.3f}")
+
+# Print metrics
+print("\nFinal Test Metrics:")
+for metric, value in test_results.items():
+    if metric != "classification_report" and isinstance(value, (int, float)):
+        print(f"{metric}: {value:.4f}")
+
+
+def process_dataset_embeddings(model, dataset_loader, raw_data):
+    all_predictions = []
+    all_labels = []
+    all_embeddings = []
+
+    with torch.no_grad():
+        for batch in dataset_loader:
+            # Move batch to GPU
+            batch = {k: v.to(model.device) for k, v in batch.items()}
+
+            # Get model outputs
+            outputs = model(**batch)
+
+            # Process predictions
+            predictions = torch.sigmoid(outputs.logits).cpu().numpy().tolist()
+            all_predictions.extend(predictions)
+            all_labels.extend(batch["labels"].cpu().numpy().tolist())
+
+            # Process embeddings
+            embeddings = outputs.hidden_states[-1].cpu()
+            attention_mask = batch["attention_mask"].cpu().unsqueeze(-1)
+            embeddings = (embeddings * attention_mask).sum(dim=1) / attention_mask.sum(
+                dim=1
+            )
+            embeddings = embeddings.numpy().tolist()
+            all_embeddings.extend(embeddings)
+
+            # Clear memory
+            del outputs
+            del embeddings
+            torch.cuda.empty_cache()
+
+    texts = [example["text"] for example in raw_data]
+    label_strings = [" ".join(example["labels"]) for example in raw_data]
+
+    return all_predictions, all_labels, all_embeddings, texts, label_strings
+
+
+def save_predictions_and_embeddings(
+    predictions, labels, embeddings, texts, label_strings, prefix, working_dir
+):
+    # Save predictions
+    with open(f"{working_dir}/{prefix}_predictions.jsonl", "w", encoding="utf-8") as f:
+        for probs, labels, text, labels_str in zip(
+            predictions, labels, texts, label_strings
+        ):
+            json.dump(
+                {
+                    "pred_probs": probs,
+                    "labels": labels,
+                    "text": text,
+                    "labels_str": labels_str,
+                },
+                f,
+                ensure_ascii=False,
+            )
+            f.write("\n")
+
+    # Save embeddings
+    with open(f"{working_dir}/{prefix}_embeddings.jsonl", "w", encoding="utf-8") as f:
+        for embedding, text in zip(embeddings, texts):
+            json.dump(
+                {
+                    "embedding": embedding,
+                    "text": text,
+                },
+                f,
+                ensure_ascii=False,
+            )
+            f.write("\n")
+
+
+# For final evaluation, create a new model instance with hidden states enabled
+print("\nLoading best model for evaluation...")
+
+config = AutoConfig.from_pretrained(f"{working_dir}/best_model")
+config.output_hidden_states = True
+model = AutoModelForSequenceClassification.from_pretrained(
+    f"{working_dir}/best_model", config=config
+)
+model = model.to("cuda")
+model.eval()
+
+# Process test data
+test_dataloader = DataLoader(tokenized_test, batch_size=8, shuffle=False)
+test_predictions, test_labels, test_embeddings, test_texts, test_label_strings = (
+    process_dataset_embeddings(model, test_dataloader, test_data)
+)
+
+# Save test predictions and embeddings
+save_predictions_and_embeddings(
+    test_predictions,
+    test_labels,
+    test_embeddings,
+    test_texts,
+    test_label_strings,
+    "test",
+    working_dir,
+)
+
+# If embed_all flag is set, process and save train and dev data as well
+if EMBED_ALL:
+    print("\nProcessing training data embeddings...")
+    train_dataloader = DataLoader(tokenized_train, batch_size=8, shuffle=False)
+    (
+        train_predictions,
+        train_labels,
+        train_embeddings,
+        train_texts,
+        train_label_strings,
+    ) = process_dataset_embeddings(model, train_dataloader, train_data)
+    save_predictions_and_embeddings(
+        train_predictions,
+        train_labels,
+        train_embeddings,
+        train_texts,
+        train_label_strings,
+        "train",
+        working_dir,
+    )
+
+    print("\nProcessing dev data embeddings...")
+    dev_dataloader = DataLoader(tokenized_dev, batch_size=8, shuffle=False)
+    dev_predictions, dev_labels, dev_embeddings, dev_texts, dev_label_strings = (
+        process_dataset_embeddings(model, dev_dataloader, dev_data)
+    )
+    save_predictions_and_embeddings(
+        dev_predictions,
+        dev_labels,
+        dev_embeddings,
+        dev_texts,
+        dev_label_strings,
+        "dev",
+        working_dir,
+    )
